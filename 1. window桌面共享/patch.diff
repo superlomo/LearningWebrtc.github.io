@@ -1,0 +1,306 @@
+From 4b44d9b204a1ae616d8a4f5337f9d55200b4c119 Mon Sep 17 00:00:00 2001
+From: superlomo <1690362650@qq.com>
+Date: Sat, 1 Jan 2022 20:35:15 +0800
+Subject: [PATCH] support desktop stream
+
+---
+ examples/BUILD.gn                             |   2 +
+ examples/peerconnection/client/conductor.cc   |   8 +-
+ .../peerconnection/client/desktop_capture.h   | 238 ++++++++++++++++++
+ 3 files changed, 246 insertions(+), 2 deletions(-)
+ create mode 100644 examples/peerconnection/client/desktop_capture.h
+
+diff --git a/examples/BUILD.gn b/examples/BUILD.gn
+index 8dd998cc3b..7b8fef6679 100644
+--- a/examples/BUILD.gn
++++ b/examples/BUILD.gn
+@@ -663,6 +663,7 @@ if (is_linux || is_chromeos || is_win) {
+       "peerconnection/client/defaults.h",
+       "peerconnection/client/peer_connection_client.cc",
+       "peerconnection/client/peer_connection_client.h",
++      "peerconnection/client/desktop_capture.h",
+     ]
+ 
+     deps = [
+@@ -689,6 +690,7 @@ if (is_linux || is_chromeos || is_win) {
+       "../test:rtp_test_utils",
+       "//third_party/abseil-cpp/absl/memory",
+       "//third_party/abseil-cpp/absl/types:optional",
++      "../modules/desktop_capture:desktop_capture",
+     ]
+     if (is_win) {
+       sources += [
+diff --git a/examples/peerconnection/client/conductor.cc b/examples/peerconnection/client/conductor.cc
+index 5f213deeeb..f9b99972e3 100644
+--- a/examples/peerconnection/client/conductor.cc
++++ b/examples/peerconnection/client/conductor.cc
+@@ -44,6 +44,7 @@
+ #include "rtc_base/rtc_certificate_generator.h"
+ #include "rtc_base/strings/json.h"
+ #include "test/vcm_capturer.h"
++#include "desktop_capture.h"
+ 
+ namespace {
+ // Names used for a IceCandidate JSON object.
+@@ -456,9 +457,12 @@ void Conductor::AddTracks() {
+     RTC_LOG(LS_ERROR) << "Failed to add audio track to PeerConnection: "
+                       << result_or_error.error().message();
+   }
++  
++  rtc::scoped_refptr<DesktopCaptureTrackSource> video_device =
++      DesktopCaptureTrackSource::Create();
+ 
+-  rtc::scoped_refptr<CapturerTrackSource> video_device =
+-      CapturerTrackSource::Create();
++  //rtc::scoped_refptr<CapturerTrackSource> video_device =
++  //    CapturerTrackSource::Create();
+   if (video_device) {
+     rtc::scoped_refptr<webrtc::VideoTrackInterface> video_track_(
+         peer_connection_factory_->CreateVideoTrack(kVideoLabel, video_device));
+diff --git a/examples/peerconnection/client/desktop_capture.h b/examples/peerconnection/client/desktop_capture.h
+new file mode 100644
+index 0000000000..3def8d1309
+--- /dev/null
++++ b/examples/peerconnection/client/desktop_capture.h
+@@ -0,0 +1,238 @@
++#pragma once
++#include "modules/desktop_capture/desktop_capturer.h"
++#include "modules/desktop_capture/desktop_frame.h"
++#include "modules/desktop_capture/desktop_capture_options.h"
++#include "api/video/video_frame.h"
++#include "api/video/video_source_interface.h"
++#include "media/base/video_adapter.h"
++#include "api/video/i420_buffer.h"
++#include "media/base/video_broadcaster.h"
++#include <rtc_base/logging.h>
++#include <thread>
++#include <atomic>
++#include "third_party/libyuv/include/libyuv.h"
++#include "pc/video_track_source.h"
++
++class DesktopCaptureSource : public rtc::VideoSourceInterface<webrtc::VideoFrame> {
++ public:
++     void AddOrUpdateSink(rtc::VideoSinkInterface<webrtc::VideoFrame>* sink,
++         const rtc::VideoSinkWants& wants) override {
++    broadcaster_.AddOrUpdateSink(sink, wants);
++       UpdateVideoAdapter();
++  }
++
++     void RemoveSink(rtc::VideoSinkInterface<webrtc::VideoFrame>* sink) override {
++    broadcaster_.RemoveSink(sink);
++       UpdateVideoAdapter();
++  }
++
++  protected:
++      void onFrame(const webrtc::VideoFrame& frame) { 
++        int cropped_width = 0;
++        int cropped_height = 0;
++        int out_width = 0;
++        int out_height = 0;
++
++        if (!video_adapter_.AdaptFrameResolution(frame.width(), frame.height(),
++                                                 frame.timestamp_us() * 1000,
++                &cropped_width, &cropped_height, &out_width, &out_height)) {
++          return;
++        }
++
++        if (out_height != frame.height() || out_width != frame.width()) {
++          rtc::scoped_refptr<webrtc::I420Buffer> scaled_buffer =
++              webrtc::I420Buffer::Create(out_width, out_height);
++          scaled_buffer->ScaleFrom(*frame.video_frame_buffer()->ToI420());
++          webrtc::VideoFrame::Builder new_frame_builder =
++              webrtc::VideoFrame::Builder()
++                  .set_video_frame_buffer(scaled_buffer)
++                  .set_rotation(webrtc::kVideoRotation_0)
++                  .set_timestamp_us(frame.timestamp_us())
++                  .set_id(frame.id());
++
++          if (frame.has_update_rect()) {
++            webrtc::VideoFrame::UpdateRect new_rect =
++                frame.update_rect().ScaleWithFrame(
++                    frame.width(), frame.height(), 0, 0, frame.width(),
++                    frame.height(), out_width, out_height);
++
++            new_frame_builder.set_update_rect(new_rect);
++          }
++          broadcaster_.OnFrame(new_frame_builder.build());
++        } else {
++          broadcaster_.OnFrame(frame);
++        }
++  }
++
++  private:
++      void UpdateVideoAdapter() {
++
++  }
++
++  rtc::VideoBroadcaster broadcaster_;
++  cricket::VideoAdapter video_adapter_;
++};
++
++class DesktopCapture : public DesktopCaptureSource,
++                       public webrtc::DesktopCapturer::Callback,
++                       public rtc ::VideoSinkInterface<webrtc ::VideoFrame> {
++ public:
++     static DesktopCapture* Create(size_t target_fps, size_t capture_screen_index) {
++    std::unique_ptr<DesktopCapture> dc(new DesktopCapture());
++       if (!dc->Init(target_fps, capture_screen_index)) {
++      RTC_LOG(LS_WARNING) << "Fail to create DesktopCapture(fps = " << target_fps
++                          << ")";
++         return nullptr;
++       }
++
++       dc->StartCapture();
++       return dc.release();
++  }
++
++  ~DesktopCapture() { 
++      Destroy();
++  }
++
++  std::string GetWindowTitle() const { return window_title_; }
++
++  void StartCapture() { 
++      if (start_flag_) {
++      RTC_LOG(WARNING) << "Capture already been running...";
++        return;
++      }
++
++      start_flag_ = true;
++
++      capture_thread_.reset(new std::thread([this]() {
++        dc_->Start(this);
++
++        while (start_flag_) {
++          dc_->CaptureFrame();
++          std::this_thread::sleep_for(std::chrono::milliseconds(1000 / fps_));
++        }
++      }));
++  }
++
++  void StopCapture() { 
++      start_flag_ = false;
++    if (capture_thread_ && capture_thread_->joinable()) {
++        capture_thread_->join();
++    }
++  }
++
++  private:
++  DesktopCapture()
++       : dc_(nullptr),
++         start_flag_(false) {}
++
++  void Destroy() { 
++      StopCapture();
++
++      if (!dc_)
++        return;
++
++      dc_.reset(nullptr);
++  }
++
++  void OnFrame(const webrtc::VideoFrame& frame) override {}
++
++  bool Init(size_t target_fps, size_t capture_screen_index) {
++    dc_ = webrtc::DesktopCapturer::CreateScreenCapturer(
++        webrtc::DesktopCaptureOptions::CreateDefault());
++
++    if (!dc_)
++      return false;
++
++    webrtc::DesktopCapturer::SourceList sources;
++
++    dc_->GetSourceList(&sources);
++    if (capture_screen_index > sources.size()) {
++      RTC_LOG(LS_WARNING) << "The total sources of screen is " << sources.size()
++                          << ", but require source of index at "
++                          << capture_screen_index;
++      return false;
++    }
++    RTC_CHECK(dc_->SelectSource(sources[capture_screen_index].id));
++    window_title_ = sources[capture_screen_index].title;
++
++    fps_ = target_fps;
++    RTC_LOG(LS_INFO) << "Init Desktopcapture finish";
++
++    return true;
++  }
++
++  void OnCaptureResult(webrtc::DesktopCapturer::Result result,
++                       std::unique_ptr<webrtc::DesktopFrame> frame) override {
++    //RTC_LOG(LS_INFO) << "new frame";
++    static auto timestamp =
++        std::chrono::duration_cast<std::chrono::milliseconds>(
++            std::chrono::system_clock::now().time_since_epoch())
++            .count();
++    static size_t cnt = 0;
++
++    cnt++;
++
++    auto timestamp_curr =
++        std::chrono::duration_cast<std::chrono::milliseconds>(
++            std::chrono::system_clock::now().time_since_epoch())
++            .count();
++
++    if (timestamp_curr - timestamp > 1000) {
++      RTC_LOG(LS_INFO) << " FPS: " << cnt;
++      cnt = 0;
++      timestamp = timestamp_curr;
++    }
++
++    if (result != webrtc::DesktopCapturer::Result::SUCCESS) {
++      RTC_LOG(LS_ERROR) << "Capture frame failed, result: " << result;
++    }
++
++    int width = frame->size().width();
++    int height = frame->size().height();
++
++    if (!i420_buffer_.get() ||
++        i420_buffer_->width() * i420_buffer_->height() < width * height) {
++      i420_buffer_ = webrtc::I420Buffer::Create(width, height);
++    }
++
++    libyuv::ConvertToI420(frame->data(), 0, i420_buffer_->MutableDataY(),
++                          i420_buffer_->StrideY(), i420_buffer_->MutableDataU(),
++                          i420_buffer_->StrideU(), i420_buffer_->MutableDataV(),
++                          i420_buffer_->StrideV(), 0, 0, width, height, width,
++                          height, libyuv::kRotate0, libyuv::FOURCC_ARGB);
++    DesktopCaptureSource::onFrame(
++        webrtc::VideoFrame(i420_buffer_, 0, 0, webrtc::kVideoRotation_0));
++  }
++
++  std::unique_ptr<webrtc::DesktopCapturer> dc_;
++
++  size_t fps_;
++
++  std::string window_title_;
++
++  std::unique_ptr<std::thread> capture_thread_;
++
++  std::atomic_bool start_flag_;
++
++  rtc::scoped_refptr<webrtc::I420Buffer> i420_buffer_;
++};
++
++class DesktopCaptureTrackSource : public webrtc::VideoTrackSource {
++ public:
++     static rtc::scoped_refptr<DesktopCaptureTrackSource> Create() {
++    std::unique_ptr<DesktopCapture> capturer(DesktopCapture::Create(30, 0));
++       return new rtc::RefCountedObject<DesktopCaptureTrackSource>(
++           std::move(capturer));
++  }
++
++     protected:
++  explicit DesktopCaptureTrackSource(std::unique_ptr<DesktopCapture> capturer)
++          : VideoTrackSource(false), capturer_(std::move(capturer)) {}
++
++  private:
++  rtc::VideoSourceInterface<webrtc::VideoFrame>* source() override {
++    return capturer_.get();
++  }
++
++  std::unique_ptr<DesktopCapture> capturer_;
++};
+-- 
+2.29.2.windows.2
+
